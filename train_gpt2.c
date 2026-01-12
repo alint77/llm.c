@@ -27,6 +27,8 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+// defines: matmul_forward_fast
+#include "matmul.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -181,37 +183,25 @@ void matmul_forward_naive(float* out,
     }
 }
 
-void matmul_forward(float* out,
-                    const float* inp, const float* weight, const float* bias,
-                    int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_backward
-    // therefore, the implementation below is very mildly optimized
-    // this function is otherwise identical to that of matmul_forward_naive()
-    // OC is short for "output channels"
+static void matmul_forward_omp(float* out,
+                              const float* inp, const float* weight, const float* bias,
+                              int B, int T, int C, int OC) {
+    // Original train_gpt2.c implementation (kept for large OC, e.g. vocab projection)
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // out will be (B,T,OC)
 
-    // make sure the tiled loop will be correct or fallback to naive version
     const int LOOP_UNROLL = 8;
     if (B*T % LOOP_UNROLL != 0) {
         matmul_forward_naive(out, inp, weight, bias, B, T, C, OC);
         return;
     }
 
-    // collapse the B and T loops into one and turn it into a strided loop.
-    // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
     #pragma omp parallel for
     for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
         for (int o = 0; o < OC; o++) {
-            // we'll keep LOOP_UNROLL many results in registers
             float result[LOOP_UNROLL];
-            // initialize the bias, if it exists
             for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                 result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
             }
-            // inner loops. Because we do LOOP_UNROLL steps of inner bt, we can cache
-            // the value of weight[i + o * C] and reuse it.
-            // we compile with -Ofast, so the compiler will turn the inner loop into FMAs
             for (int i = 0; i < C; i++) {
                 float w = weight[i + o * C];
                 for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
@@ -219,12 +209,24 @@ void matmul_forward(float* out,
                     result[ibt] += inp[bt * C + i] * w;
                 }
             }
-            // write back results to main memory
             for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                 int bt = obt + ibt;
                 out[bt * OC + o] = result[ibt];
             }
         }
+    }
+}
+
+void matmul_forward(float* out,
+                    const float* inp, const float* weight, const float* bias,
+                    int B, int T, int C, int OC) {
+    // Fast path for the common matmuls (OC ~ 768/2304/3072).
+    // For very large OC (vocab projection), the original OpenMP kernel can be faster
+    // due to better weight reuse across more rows.
+    if (OC >= 8192) {
+        matmul_forward_omp(out, inp, weight, bias, B, T, C, OC);
+    } else {
+        matmul_forward_fast(out, inp, weight, bias, B, T, C, OC);
     }
 }
 
@@ -1076,6 +1078,10 @@ int sample_mult(float* probabilities, int n, float coin) {
 // main training loop
 int main() {
 
+#ifdef OMP
+    omp_set_num_threads(32);
+#endif
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
@@ -1122,42 +1128,42 @@ int main() {
             printf("val loss %f\n", val_loss);
         }
 
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot_token;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the Vp-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
-                float coin = random_f32(&rng_state);
-                // note we're only sampling from the first V elements, ignoring padding
-                // (the probabilities in the padded region should be zero anyway)
-                int next_token = sample_mult(probs, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
+        // // once in a while do model inference to print generated text
+        // if (step > 0 && step % 20 == 0) {
+        //     // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+        //     for(int i = 0; i < B * T; ++i) {
+        //         gen_tokens[i] = tokenizer.eot_token;
+        //     }
+        //     // now sample from the model autoregressively
+        //     printf("generating:\n---\n");
+        //     for (int t = 1; t < genT; t++) {
+        //         // note that inference is very wasteful here because for each token
+        //         // we re-calculate the forward pass for all of (B,T) positions from scratch
+        //         // but the inference here is just for sanity checking anyway
+        //         // and we can maybe optimize a bit more later, with careful tests
+        //         gpt2_forward(&model, gen_tokens, NULL, B, T);
+        //         // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+        //         // we're in principle running B "inference streams" in parallel here
+        //         // but only using position 0
+        //         // get the Vp-dimensional vector probs[0, t-1, :]
+        //         float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
+        //         float coin = random_f32(&rng_state);
+        //         // note we're only sampling from the first V elements, ignoring padding
+        //         // (the probabilities in the padded region should be zero anyway)
+        //         int next_token = sample_mult(probs, model.config.vocab_size, coin);
+        //         gen_tokens[t] = next_token;
+        //         // print the generated token, either using the Tokenizer or a fallback
+        //         if (tokenizer.init_ok) {
+        //             const char* token_str = tokenizer_decode(&tokenizer, next_token);
+        //             safe_printf(token_str);
+        //         } else {
+        //             // fall back to printing the token id
+        //             printf("%d ", next_token);
+        //         }
+        //         fflush(stdout);
+        //     }
+        //     printf("\n---\n");
+        // }
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);

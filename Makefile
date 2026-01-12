@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
+CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes -z noexecstack
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
@@ -244,7 +244,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 test_matmul train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
@@ -261,11 +261,21 @@ $(info ---------------------------------------------)
 
 all: $(TARGETS)
 
-train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+# Assembly matmul kernels
+$(BUILD_DIR)/matmul_ab.o: matmul_ab.asm
+	nasm -f elf64 -O3 -o $@ $<
+
+$(BUILD_DIR)/matmul_abt.o: matmul_abt.asm
+	nasm -f elf64 -O3 -o $@ $<
+
+train_gpt2: train_gpt2.c matmul.c $(BUILD_DIR)/matmul_ab.o $(BUILD_DIR)/matmul_abt.o
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -fopenmp -DOMP $^ $(LDLIBS) $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+test_matmul: test_matmul.c matmul.c $(BUILD_DIR)/matmul_ab.o $(BUILD_DIR)/matmul_abt.o
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -fopenmp -DOMP $^ $(LDLIBS) $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
