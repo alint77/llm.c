@@ -231,26 +231,61 @@ void matmul_forward(float* out,
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_forward
-    // this backward could be done in a single "round" of loops
-    // but that doesn't afford an efficient parallelization strategy
-
-    // backward into inp first, parallelize over B,T
+    
+    // 1. Backward into inp (dinp = dout * weight)
+    // We create a temporary transposed weight matrix to improve memory access patterns.
+    // Original weight is (OC, C) row-major. We want to iterate i (0..C) outer.
+    // dInp[:, i] = dout * weight[:, i].
+    // If we use weightt (C, OC), then row i of weightt is col i of weight.
+    // This allows us to load a row of weightt and scan dout linearly.
+    
+    float* weight_t = (float*)mallocCheck(C * OC * sizeof(float));
     #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            const float* dout_bt = dout + b * T * OC + t * OC;
-            float* dinp_bt = dinp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
-                const float* wrow = weight + o*C;
-                float d = dout_bt[o];
-                for (int i = 0; i < C; i++) {
-                    dinp_bt[i] += wrow[i] * d;
+    for (int i = 0; i < C; i++) {
+        for (int o = 0; o < OC; o++) {
+            weight_t[i * OC + o] = weight[o * C + i];
+        }
+    }
+
+    // We block the B*T loop to keep the dout data in L2/L3 cache
+    // The inner loop iterates over i (columns of dinp)
+    int BT = B * T;
+    // Chunk size for blocking BT loop. 
+    // dout block size = 32 * OC * 4 bytes. If OC=50257, 128*50KB = 6.4 MB. Fits in L3.
+    const int BLOCK_BT = 32; 
+
+    #pragma omp parallel
+    {
+        // Iterate over blocks of time steps
+        for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
+            int bt_end = (bt_blk + BLOCK_BT > BT) ? BT : (bt_blk + BLOCK_BT);
+            
+            // Distribute columns of dinp among threads.
+            // Using static schedule ensures threads own distinct cache lines of dinp
+            // (assuming C is large enough, 768 > 16)
+            #pragma omp for schedule(static)
+            for (int i = 0; i < C; i++) {
+                const float* w_row = weight_t + i * OC;
+                // Inner loop over the block of time steps
+                for (int bt = bt_blk; bt < bt_end; bt++) {
+                    const float* d_row = dout + bt * OC;
+                    float sum = 0.0f;
+                    // Vectorized dot product
+                    // This scans d_row (stride 1) and w_row (stride 1)
+                    #pragma omp simd reduction(+:sum)
+                    for (int o = 0; o < OC; o++) {
+                        sum += d_row[o] * w_row[o];
+                    }
+                    dinp[bt * C + i] += sum;
                 }
             }
         }
     }
+    
+    free(weight_t);
+
     // backward into weight/bias, parallelize over output channels OC
+    // This part is also bandwidth bound but let's keep it simple for now as requested
     #pragma omp parallel for
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
@@ -762,6 +797,35 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+typedef struct {
+    double matmul_forward;
+    double matmul_backward;
+    double attention_forward;
+    double attention_backward;
+    double layernorm_forward;
+    double layernorm_backward;
+    double gelu_forward;
+    double gelu_backward;
+    double residual_forward;
+    double residual_backward;
+    double encoder_forward;
+    double encoder_backward;
+    double crossentropy_forward;
+    double crossentropy_softmax_backward;
+    double softmax_forward;
+    double adamw_update;
+} Profiling;
+Profiling profiling = {0};
+
+static double get_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+#define START(name) { double start_##name = get_time();
+#define END(name) profiling.name += get_time() - start_##name; }
+
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
@@ -822,7 +886,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
+    START(encoder_forward);
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    END(encoder_forward);
+
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -860,25 +927,64 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
+        START(layernorm_forward);
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        END(layernorm_forward);
+
+        START(matmul_forward);
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        END(matmul_forward);
+
+        START(attention_forward);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        END(attention_forward);
+
+        START(matmul_forward);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        END(matmul_forward);
+
+        START(residual_forward);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        END(residual_forward);
+
+        START(layernorm_forward);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        END(layernorm_forward);
+
+        START(matmul_forward);
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        END(matmul_forward);
+
+        START(gelu_forward);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        END(gelu_forward);
+
+        START(matmul_forward);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        END(matmul_forward);
+
+        START(residual_forward);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        END(residual_forward);
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    START(layernorm_forward);
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+    END(layernorm_forward);
+
+    START(matmul_forward);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    END(matmul_forward);
+
+    START(softmax_forward);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
+    END(softmax_forward);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
+        START(crossentropy_forward);
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
+        END(crossentropy_forward);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
@@ -931,11 +1037,19 @@ void gpt2_backward(GPT2 *model) {
     float dloss_mean = 1.0f / (B*T);
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
 
+    START(crossentropy_softmax_backward);
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
+    END(crossentropy_softmax_backward);
+
+    START(matmul_backward);
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
+    END(matmul_backward);
+
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
+    START(layernorm_backward);
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    END(layernorm_backward);
 
     for (int l = L-1; l >= 0; l--) {
 
@@ -990,18 +1104,49 @@ void gpt2_backward(GPT2 *model) {
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
         // backprop this layer
+        START(residual_backward);
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
+        END(residual_backward);
+
+        START(matmul_backward);
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        END(matmul_backward);
+
+        START(gelu_backward);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
+        END(gelu_backward);
+
+        START(matmul_backward);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        END(matmul_backward);
+
+        START(layernorm_backward);
         layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        END(layernorm_backward);
+
+        START(residual_backward);
         residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
+        END(residual_backward);
+
+        START(matmul_backward);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        END(matmul_backward);
+
+        START(attention_backward);
         attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
+        END(attention_backward);
+
+        START(matmul_backward);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        END(matmul_backward);
+
+        START(layernorm_backward);
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        END(layernorm_backward);
     }
+    START(encoder_backward)
     encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
+    END(encoder_backward)
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
@@ -1013,6 +1158,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
 
+    START(adamw_update);
     for (size_t i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
@@ -1030,6 +1176,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         model->v_memory[i] = v;
         model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
     }
+    END(adamw_update);
 }
 
 void gpt2_free(GPT2 *model) {
@@ -1122,42 +1269,42 @@ int main() {
             printf("val loss %f\n", val_loss);
         }
 
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot_token;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the Vp-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
-                float coin = random_f32(&rng_state);
-                // note we're only sampling from the first V elements, ignoring padding
-                // (the probabilities in the padded region should be zero anyway)
-                int next_token = sample_mult(probs, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
+        // // once in a while do model inference to print generated text
+        // if (step > 0 && step % 20 == 0) {
+        //     // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+        //     for(int i = 0; i < B * T; ++i) {
+        //         gen_tokens[i] = tokenizer.eot_token;
+        //     }
+        //     // now sample from the model autoregressively
+        //     printf("generating:\n---\n");
+        //     for (int t = 1; t < genT; t++) {
+        //         // note that inference is very wasteful here because for each token
+        //         // we re-calculate the forward pass for all of (B,T) positions from scratch
+        //         // but the inference here is just for sanity checking anyway
+        //         // and we can maybe optimize a bit more later, with careful tests
+        //         gpt2_forward(&model, gen_tokens, NULL, B, T);
+        //         // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+        //         // we're in principle running B "inference streams" in parallel here
+        //         // but only using position 0
+        //         // get the Vp-dimensional vector probs[0, t-1, :]
+        //         float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
+        //         float coin = random_f32(&rng_state);
+        //         // note we're only sampling from the first V elements, ignoring padding
+        //         // (the probabilities in the padded region should be zero anyway)
+        //         int next_token = sample_mult(probs, model.config.vocab_size, coin);
+        //         gen_tokens[t] = next_token;
+        //         // print the generated token, either using the Tokenizer or a fallback
+        //         if (tokenizer.init_ok) {
+        //             const char* token_str = tokenizer_decode(&tokenizer, next_token);
+        //             safe_printf(token_str);
+        //         } else {
+        //             // fall back to printing the token id
+        //             printf("%d ", next_token);
+        //         }
+        //         fflush(stdout);
+        //     }
+        //     printf("\n---\n");
+        // }
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1168,8 +1315,33 @@ int main() {
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        double tokens_per_sec = (B * T) / time_elapsed_s;
+        printf("step %d: train loss %f (took %f ms, %.2f tok/s)\n", step, model.mean_loss, time_elapsed_s * 1000, tokens_per_sec);
     }
+
+    // final profiling report
+    double total_time = profiling.matmul_forward + profiling.matmul_backward + profiling.attention_forward + profiling.attention_backward
+                      + profiling.layernorm_forward + profiling.layernorm_backward + profiling.gelu_forward + profiling.gelu_backward
+                      + profiling.residual_forward + profiling.residual_backward + profiling.encoder_forward + profiling.encoder_backward
+                      + profiling.crossentropy_forward + profiling.crossentropy_softmax_backward + profiling.softmax_forward + profiling.adamw_update;
+    printf("\n--- Profiling Report ---\n");
+    printf("Matmul Forward:         %10.4f s (%5.1f%%)\n", profiling.matmul_forward, 100.0 * profiling.matmul_forward / total_time);
+    printf("Matmul Backward:        %10.4f s (%5.1f%%)\n", profiling.matmul_backward, 100.0 * profiling.matmul_backward / total_time);
+    printf("Attention Forward:      %10.4f s (%5.1f%%)\n", profiling.attention_forward, 100.0 * profiling.attention_forward / total_time);
+    printf("Attention Backward:     %10.4f s (%5.1f%%)\n", profiling.attention_backward, 100.0 * profiling.attention_backward / total_time);
+    printf("Layernorm Forward:      %10.4f s (%5.1f%%)\n", profiling.layernorm_forward, 100.0 * profiling.layernorm_forward / total_time);
+    printf("Layernorm Backward:     %10.4f s (%5.1f%%)\n", profiling.layernorm_backward, 100.0 * profiling.layernorm_backward / total_time);
+    printf("Gelu Forward:           %10.4f s (%5.1f%%)\n", profiling.gelu_forward, 100.0 * profiling.gelu_forward / total_time);
+    printf("Gelu Backward:          %10.4f s (%5.1f%%)\n", profiling.gelu_backward, 100.0 * profiling.gelu_backward / total_time);
+    printf("Residual Forward:       %10.4f s (%5.1f%%)\n", profiling.residual_forward, 100.0 * profiling.residual_forward / total_time);
+    printf("Residual Backward:      %10.4f s (%5.1f%%)\n", profiling.residual_backward, 100.0 * profiling.residual_backward / total_time);
+    printf("Encoder Forward:        %10.4f s (%5.1f%%)\n", profiling.encoder_forward, 100.0 * profiling.encoder_forward / total_time);
+    printf("Encoder Backward:       %10.4f s (%5.1f%%)\n", profiling.encoder_backward, 100.0 * profiling.encoder_backward / total_time);
+    printf("Crossentropy Forward:   %10.4f s (%5.1f%%)\n", profiling.crossentropy_forward, 100.0 * profiling.crossentropy_forward / total_time);
+    printf("Crossentropy Backward:  %10.4f s (%5.1f%%)\n", profiling.crossentropy_softmax_backward, 100.0 * profiling.crossentropy_softmax_backward / total_time);
+    printf("Softmax Forward:        %10.4f s (%5.1f%%)\n", profiling.softmax_forward, 100.0 * profiling.softmax_forward / total_time);
+    printf("AdamW Update:           %10.4f s (%5.1f%%)\n", profiling.adamw_update, 100.0 * profiling.adamw_update / total_time);
+    printf("Total Measured Time:    %10.4f s\n", total_time);
 
     // free
     dataloader_free(&train_loader);
