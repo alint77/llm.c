@@ -117,18 +117,21 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     // at each position (b,t) of the input, the C-dimensional vector
     // of activations gets normalized, then scaled and shifted
     float eps = 1e-5f;
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
             float* x = inp + b * T * C + t * C;
             // calculate the mean
             float m = 0.0f;
+            #pragma omp simd reduction(+:m)
             for (int i = 0; i < C; i++) {
                 m += x[i];
             }
             m = m/C;
             // calculate the variance (without any bias correction)
             float v = 0.0f;
+            #pragma omp simd reduction(+:v)
             for (int i = 0; i < C; i++) {
                 float xshift = x[i] - m;
                 v += xshift * xshift;
@@ -138,6 +141,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
             float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
+            #pragma omp simd
             for (int i = 0; i < C; i++) {
                 float n = (s * (x[i] - m)); // normalize
                 float o = n * weight[i] + bias[i]; // scale and shift
@@ -153,17 +157,22 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         float* dout, float* inp, float* weight, float* mean, float* rstd,
                         int B, int T, int C) {
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* dout_bt = dout + b * T * C + t * C;
-            float* inp_bt = inp + b * T * C + t * C;
-            float* dinp_bt = dinp + b * T * C + t * C;
-            float mean_bt = mean[b * T + t];
-            float rstd_bt = rstd[b * T + t];
+    #pragma omp parallel
+    {
+        float* dbias_thr = (float*) calloc(C, sizeof(float));
+        float* dweight_thr = (float*) calloc(C, sizeof(float));
+        #pragma omp for
+        for (int bt = 0; bt < B * T; bt++) {
+            float* dout_bt = dout + bt * C;
+            float* inp_bt = inp + bt * C;
+            float* dinp_bt = dinp + bt * C;
+            float mean_bt = mean[bt];
+            float rstd_bt = rstd[bt];
 
             // first: two reduce operations
             float dnorm_mean = 0.0f;
             float dnorm_norm_mean = 0.0f;
+            #pragma omp simd reduction(+:dnorm_mean, dnorm_norm_mean)
             for (int i = 0; i < C; i++) {
                 float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 float dnorm_i = weight[i] * dout_bt[i];
@@ -174,13 +183,14 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
             dnorm_norm_mean = dnorm_norm_mean / C;
 
             // now iterate again and accumulate all the gradients
+            #pragma omp simd
             for (int i = 0; i < C; i++) {
                 float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 float dnorm_i = weight[i] * dout_bt[i];
                 // gradient contribution to bias
-                dbias[i] += dout_bt[i];
+                dbias_thr[i] += dout_bt[i];
                 // gradient contribution to weight
-                dweight[i] += norm_bti * dout_bt[i];
+                dweight_thr[i] += norm_bti * dout_bt[i];
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
@@ -190,6 +200,15 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
                 dinp_bt[i] += dval;
             }
         }
+        #pragma omp critical
+        {
+            for (int i = 0; i < C; i++) {
+                dbias[i] += dbias_thr[i];
+                dweight[i] += dweight_thr[i];
+            }
+        }
+        free(dbias_thr);
+        free(dweight_thr);
     }
 }
 
@@ -680,6 +699,7 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
     // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+    #pragma omp parallel for
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
@@ -693,6 +713,7 @@ void gelu_forward(float* out, float* inp, int N) {
 __attribute__((optimize("no-finite-math-only")))
 #endif
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
+    #pragma omp parallel for
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
@@ -707,19 +728,21 @@ void gelu_backward(float* dinp, float* inp, float* dout, int N) {
 #pragma float_control(pop)
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
+    #pragma omp parallel for simd
     for (int i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
 }
 
 void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
+    #pragma omp parallel for simd
     for (int i = 0; i < N; i++) {
         dinp1[i] += dout[i];
         dinp2[i] += dout[i];
     }
 }
 
-void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
+void softmax_forward(float* restrict probs, float* restrict logits, int B, int T, int V, int Vp) {
     // output: probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
     // input: logits is (B,T,Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
@@ -731,21 +754,25 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
             float* logits_bt = logits + b * T * Vp + t * Vp;
             float* probs_bt = probs + b * T * Vp + t * Vp;
 
-            // maxval is only calculated and subtracted for numerical stability
-            float maxval = -10000.0f; // TODO something better
-            for (int i = 0; i < V; i++) {
+            float maxval = logits_bt[0];
+            #pragma omp simd reduction(max:maxval)
+            for (int i = 1; i < V; i++) {
                 if (logits_bt[i] > maxval) {
                     maxval = logits_bt[i];
                 }
             }
             float sum = 0.0f;
+            #pragma omp simd reduction(+:sum)
             for (int i = 0; i < V; i++) {
-                probs_bt[i] = expf(logits_bt[i] - maxval);
-                sum += probs_bt[i];
+                float p = expf(logits_bt[i] - maxval);
+                probs_bt[i] = p;
+                sum += p;
             }
             // note we only loop to V, leaving the padded dimensions
+            float scale = 1.0f / sum;
+            #pragma omp simd
             for (int i = 0; i < V; i++) {
-                probs_bt[i] /= sum;
+                probs_bt[i] *= scale;
             }
             // for extra super safety we may wish to include this too,
             // forcing the probabilities here to be zero, but it shouldn't matter
