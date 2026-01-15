@@ -20,7 +20,11 @@ We have significantly improved the performance of the backward pass operations c
    - **Parallelization:** Added OpenMP pragma collapse to parallelize over both Batch and Head dimensions.
    - **Vectorization:** Rewritten inner loops to allow compiler auto-vectorization over the head size dimension.
 
-3. **Profiling**
+3. **AdamW Optimizer (`gpt2_update`) - ~10% Speedup**
+   - **Parallelization & Vectorization:** Added OpenMP threads and SIMD directives to fully saturate memory bandwidth.
+   - **Loop Invariant Hoisting:** Pre-calculated scalar bias correction terms outside the parameter loop to reduce arithmetic intensity.
+
+4. **Profiling**
    - Added a detailed profiling system to track the execution time of every individual layer (forward and backward passes).
    - Reports `tokens/s` throughput in real-time.
 
@@ -36,14 +40,14 @@ Comparing this optimized version against the vanilla reference implementation on
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 23.37 s | 440 tokens/s | 1.0x |
-| **Optimized** | **15.21 s** | **760 tokens/s** | **1.54x** |
+| **Optimized** | **14.87 s** | **780 tokens/s** | **1.77x** |
 
 ### Batch Size = 16
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 94.42 s | 480 tokens/s | 1.0x |
-| **Optimized** | **47.64 s** | **1000 tokens/s** | **2.1x** |
+| **Optimized** | **46.7 s** | **1020 tokens/s** | **2.1x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 
@@ -67,13 +71,24 @@ At the end of training, you will see a detailed breakdown of where time is spent
 
 ```
 --- Profiling Report ---
-Matmul Forward:            12.1843 s ( 26.5%)
-Matmul Backward (dinp):    14.1394 s ( 30.8%)
-Matmul Backward (dw/db):   11.7800 s ( 25.6%)
-Attention Forward:          0.2680 s (  0.6%)
-Attention Backward:         0.3644 s (  0.8%)
-...
-Total Measured Time:       45.9417 s
+Matmul Forward:            12.5634 s ( 26.9%)
+Matmul Backward (dinp):    14.9213 s ( 31.9%)
+Matmul Backward (dw/db):   11.6382 s ( 24.9%)
+Attention Forward:          0.2749 s (  0.6%)
+Attention Backward:         0.3719 s (  0.8%)
+Layernorm Forward:          0.2523 s (  0.5%)
+Layernorm Backward:         0.7389 s (  1.6%)
+Gelu Forward:               0.6738 s (  1.4%)
+Gelu Backward:              0.7948 s (  1.7%)
+Residual Forward:           0.2945 s (  0.6%)
+Residual Backward:          0.2255 s (  0.5%)
+Encoder Forward:            0.0140 s (  0.0%)
+Encoder Backward:           0.0085 s (  0.0%)
+Crossentropy Forward:       0.0021 s (  0.0%)
+Crossentropy Backward:      0.4959 s (  1.1%)
+Softmax Forward:            0.7388 s (  1.6%)
+AdamW Update:               2.7006 s (  5.8%)
+Total Measured Time:       46.7093 s
 ```
 
 ## License

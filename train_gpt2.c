@@ -1253,19 +1253,32 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 
     START(adamw_update);
+    
+    // Precalculate loop invariants
+    float one_minus_beta1 = 1.0f - beta1;
+    float one_minus_beta2 = 1.0f - beta2;
+    float bias_correction1 = 1.0f - powf(beta1, t);
+    float bias_correction2 = 1.0f - powf(beta2, t);
+    float scale_m = 1.0f / bias_correction1;
+    float scale_v = 1.0f / bias_correction2;
+
+    #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
+        float m_old = model->m_memory[i];
+        float v_old = model->v_memory[i];
 
         // update the first moment (momentum)
-        float m = beta1 * model->m_memory[i] + (1.0f - beta1) * grad;
+        float m = beta1 * m_old + one_minus_beta1 * grad;
         // update the second moment (RMSprop)
-        float v = beta2 * model->v_memory[i] + (1.0f - beta2) * grad * grad;
-        // bias-correct both moments
-        float m_hat = m / (1.0f - powf(beta1, t));
-        float v_hat = v / (1.0f - powf(beta2, t));
+        float v = beta2 * v_old + one_minus_beta2 * grad * grad;
 
-        // update
+        // bias-correct both moments
+        float m_hat = m * scale_m;
+        float v_hat = v * scale_v;
+
+        // update memory
         model->m_memory[i] = m;
         model->v_memory[i] = v;
         model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
@@ -1328,7 +1341,7 @@ int main() {
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int B = 16; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
