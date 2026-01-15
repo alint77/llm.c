@@ -9,7 +9,7 @@ While the original repo focuses on CUDA/GPU implementations, this fork pushes th
 We have significantly improved the performance of the backward pass operations compared to the vanilla implementation.
 
 ### Key Changes
-1. **Matrix Multiplication Backward (`matmul_backward`) - ~2x Speedup**
+1. **Matrix Multiplication Backward (`matmul_backward`) - ~2.5x Speedup**
    - Split calculations into separate optimal paths for `dinp` and `dweight`/`dbias`.
    - **`dweight` / `dbias`:** Implemented "time-blocking" (BT blocks) to keep input data in the L2 cache, preventing repeated expensive memory fetches.
    - **`dinp`:** Implemented register-blocked matrix multiplication (8x32 blocks) to maximize register reuse and vector instruction throughput.
@@ -44,15 +44,15 @@ Comparing this optimized version against the vanilla reference implementation on
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
-| Vanilla | 23.37 s | 440 tokens/s | 1.0x |
-| **Optimized** | **14.87 s** | **780 tokens/s** | **1.77x** |
+| Vanilla | 23.37 s | 460 tokens/s | 1.0x |
+| **Optimized** | **13.5 s** | **880 tokens/s** | **2x** |
 
 ### Batch Size = 16
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 94.42 s | 480 tokens/s | 1.0x |
-| **Optimized** | **44.0 s** | **1060 tokens/s** | **2.15x** |
+| **Optimized** | **38.8.0 s** | **1250 tokens/s** | **2.6x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 
@@ -76,24 +76,24 @@ At the end of training, you will see a detailed breakdown of where time is spent
 
 ```
 --- Profiling Report ---
-Matmul Forward:            12.5634 s ( 26.9%)
-Matmul Backward (dinp):    14.9213 s ( 31.9%)
-Matmul Backward (dw/db):   11.6382 s ( 24.9%)
-Attention Forward:          0.2749 s (  0.6%)
-Attention Backward:         0.3719 s (  0.8%)
-Layernorm Forward:          0.2523 s (  0.5%)
-Layernorm Backward:         0.7389 s (  1.6%)
-Gelu Forward:               0.6738 s (  1.4%)
-Gelu Backward:              0.7948 s (  1.7%)
-Residual Forward:           0.2945 s (  0.6%)
-Residual Backward:          0.2255 s (  0.5%)
+Matmul Forward:            10.3064 s ( 26.9%)
+Matmul Backward (dinp):     8.4260 s ( 22.0%)
+Matmul Backward (dw/db):   12.0494 s ( 31.4%)
+Attention Forward:          0.2818 s (  0.7%)
+Attention Backward:         0.3682 s (  1.0%)
+Layernorm Forward:          0.2764 s (  0.7%)
+Layernorm Backward:         0.7222 s (  1.9%)
+Gelu Forward:               0.6990 s (  1.8%)
+Gelu Backward:              0.7324 s (  1.9%)
+Residual Forward:           0.3168 s (  0.8%)
+Residual Backward:          0.2182 s (  0.6%)
 Encoder Forward:            0.0140 s (  0.0%)
-Encoder Backward:           0.0085 s (  0.0%)
-Crossentropy Forward:       0.0021 s (  0.0%)
-Crossentropy Backward:      0.4959 s (  1.1%)
-Softmax Forward:            0.7388 s (  1.6%)
-AdamW Update:               2.7006 s (  5.8%)
-Total Measured Time:       46.7093 s
+Encoder Backward:           0.0081 s (  0.0%)
+Crossentropy Forward:       0.0022 s (  0.0%)
+Crossentropy Backward:      0.4824 s (  1.3%)
+Softmax Forward:            0.7360 s (  1.9%)
+AdamW Update:               2.7057 s (  7.1%)
+Total Measured Time:       38.3450 s
 ```
 
 ## License

@@ -329,71 +329,76 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
     START(matmul_backward_dinp);
-
-    // Strategy: Blocked Matrix Multiply (B * T, C) = (B * T, OC) x (OC, C)
-    // We iterate 'o' in the inner loop to avoid transposing 'weight' or repeated loading of 'dout'.
-    // This allows us to stream 'weight' and 'dout' through registers/L1.
-    // We block 'BT' and 'C' to keep efficient accumulators in registers.
-
+    
+    // dinp = dout * weight^T
+    // dinp(BT, C), dout(BT, OC), weight(OC, C)
+    
     int BT = B * T;
-    const int BLOCK_BT = 8;
-    const int BLOCK_C = 32;
-
-    #pragma omp parallel for collapse(2)
-    for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
-        for (int c_blk = 0; c_blk < C; c_blk += BLOCK_C) {
+    // Process 8 timesteps at a time using VLA for intermediate accumulation
+    // This allows better cache locality for 'dinp' and 'weight'.
+    
+    #pragma omp parallel for
+    for (int bt = 0; bt < BT; bt += 8) {
+        int cur_bt = (bt + 8 > BT) ? (BT - bt) : 8;
+        
+        // VLA for L1 accumulation: 8 * C
+        // C ranges from 768 to 3072. Size ~24KB to ~96KB. Fits in L2/L1.
+        float dx[8 * C];
+        // Initialize to 0. (Can't assume dinp is 0, we accumulate into dinp at end)
+        for (int i = 0; i < 8 * C; i++) dx[i] = 0.0f;
+        
+        // Block OC for cache locality of dout packing
+        int BLOCK_OC = 256; 
+        
+        for (int o_blk = 0; o_blk < OC; o_blk += BLOCK_OC) {
+            int cur_oc = (o_blk + BLOCK_OC > OC) ? (OC - o_blk) : BLOCK_OC;
             
-            // Bounds checking
-            int cur_bt = (bt_blk + BLOCK_BT > BT) ? (BT - bt_blk) : BLOCK_BT;
-            int cur_c  = (c_blk + BLOCK_C > C)   ? (C - c_blk)   : BLOCK_C;
+            // Pack dout slice [cur_bt, cur_oc] -> [cur_oc, cur_bt]
+            // We pack into a flat buffer.
+            float packed_dout[256 * 8]; 
             
-            // Accumulators: 8 rows of BT x 32 cols of C
-            float acc[8][32];
-            for (int t = 0; t < 8; t++) {
-                for (int c = 0; c < 32; c++) {
-                    acc[t][c] = 0.0f;
-                }
-            }
-            
-            // Reduce over OC
-            for (int o = 0; o < OC; o++) {
-                // Load weight row chunk: contiguous in memory
-                const float* w_ptr = weight + o * C + c_blk;
-                
-                // Load dout column chunk: strided in memory (stride OC)
-                // But efficient because of cache line spatial locality with next 'o' steps
-                // We load up to 8 scalars.
-                float d_vals[8];
-                for (int t = 0; t < cur_bt; t++) {
-                    d_vals[t] = dout[(bt_blk + t) * OC + o];
-                }
-                // Pad with 0 for safety if boundary
-                for (int t = cur_bt; t < 8; t++) d_vals[t] = 0.0f;
-                
-                // Vector math
-                #pragma omp simd
-                for (int c = 0; c < cur_c; c++) {
-                    float w = w_ptr[c];
-                    // Manual unroll for the BT dimension
-                    // We assume compiler vectorizes the 'c' loop (32 wide)
-                    acc[0][c] += d_vals[0] * w;
-                    acc[1][c] += d_vals[1] * w;
-                    acc[2][c] += d_vals[2] * w;
-                    acc[3][c] += d_vals[3] * w;
-                    acc[4][c] += d_vals[4] * w;
-                    acc[5][c] += d_vals[5] * w;
-                    acc[6][c] += d_vals[6] * w;
-                    acc[7][c] += d_vals[7] * w;
-                }
-            }
-            
-            // Accumulate back to dinp
+            // Transpose loop
             for (int t = 0; t < cur_bt; t++) {
-                float* dinp_ptr = dinp + (bt_blk + t) * C + c_blk;
-                #pragma omp simd
-                for (int c = 0; c < cur_c; c++) {
-                    dinp_ptr[c] += acc[t][c];
+                const float* d_src = dout + (bt + t) * OC + o_blk;
+                for (int o = 0; o < cur_oc; o++) {
+                    packed_dout[o * 8 + t] = d_src[o];
                 }
+            }
+            
+            // Compute: sum over O
+            for (int o = 0; o < cur_oc; o++) {
+                const float* w_ptr = weight + (o_blk + o) * C;
+                // Broadcast the 8 scalars for this O
+                float d0 = packed_dout[o*8 + 0];
+                float d1 = packed_dout[o*8 + 1];
+                float d2 = packed_dout[o*8 + 2];
+                float d3 = packed_dout[o*8 + 3];
+                float d4 = packed_dout[o*8 + 4];
+                float d5 = packed_dout[o*8 + 5];
+                float d6 = packed_dout[o*8 + 6];
+                float d7 = packed_dout[o*8 + 7];
+
+                // Vectorize over C
+                #pragma omp simd
+                for (int c = 0; c < C; c++) {
+                    dx[0*C + c] += d0 * w_ptr[c];
+                    dx[1*C + c] += d1 * w_ptr[c];
+                    dx[2*C + c] += d2 * w_ptr[c];
+                    dx[3*C + c] += d3 * w_ptr[c];
+                    dx[4*C + c] += d4 * w_ptr[c];
+                    dx[5*C + c] += d5 * w_ptr[c];
+                    dx[6*C + c] += d6 * w_ptr[c];
+                    dx[7*C + c] += d7 * w_ptr[c];
+                }
+            }
+        }
+        
+        // Accumulate into global dinp
+        for (int t = 0; t < cur_bt; t++) {
+            float* dinp_ptr = dinp + (bt + t) * C;
+            #pragma omp simd
+            for (int c = 0; c < C; c++) {
+                dinp_ptr[c] += dx[t*C + c];
             }
         }
     }
