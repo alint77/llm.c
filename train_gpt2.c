@@ -29,6 +29,39 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/dataloader.h"
 
 // ----------------------------------------------------------------------------
+// Profiling
+
+typedef struct {
+    double matmul_forward;
+    double matmul_backward_dinp;
+    double matmul_backward_dweight_dbias;
+    double attention_forward;
+    double attention_backward;
+    double layernorm_forward;
+    double layernorm_backward;
+    double gelu_forward;
+    double gelu_backward;
+    double residual_forward;
+    double residual_backward;
+    double encoder_forward;
+    double encoder_backward;
+    double crossentropy_forward;
+    double crossentropy_softmax_backward;
+    double softmax_forward;
+    double adamw_update;
+} Profiling;
+Profiling profiling = {0};
+
+static double get_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+#define START(name) { double start_##name = get_time();
+#define END(name) profiling.name += get_time() - start_##name; }
+
+// ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
@@ -231,76 +264,147 @@ void matmul_forward(float* out,
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
-    
-    // 1. Backward into inp (dinp = dout * weight)
-    // We create a temporary transposed weight matrix to improve memory access patterns.
-    // Original weight is (OC, C) row-major. We want to iterate i (0..C) outer.
-    // dInp[:, i] = dout * weight[:, i].
-    // If we use weightt (C, OC), then row i of weightt is col i of weight.
-    // This allows us to load a row of weightt and scan dout linearly.
-    
-    float* weight_t = (float*)mallocCheck(C * OC * sizeof(float));
+    START(matmul_backward_dinp);
+
+    // Strategy: Blocked Matrix Multiply (B * T, C) = (B * T, OC) x (OC, C)
+    // We iterate 'o' in the inner loop to avoid transposing 'weight' or repeated loading of 'dout'.
+    // This allows us to stream 'weight' and 'dout' through registers/L1.
+    // We block 'BT' and 'C' to keep efficient accumulators in registers.
+
+    int BT = B * T;
+    const int BLOCK_BT = 8;
+    const int BLOCK_C = 32;
+
     #pragma omp parallel for collapse(2)
-    for (int i = 0; i < C; i++) {
-        for (int o = 0; o < OC; o++) {
-            weight_t[i * OC + o] = weight[o * C + i];
+    for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
+        for (int c_blk = 0; c_blk < C; c_blk += BLOCK_C) {
+            
+            // Bounds checking
+            int cur_bt = (bt_blk + BLOCK_BT > BT) ? (BT - bt_blk) : BLOCK_BT;
+            int cur_c  = (c_blk + BLOCK_C > C)   ? (C - c_blk)   : BLOCK_C;
+            
+            // Accumulators: 8 rows of BT x 32 cols of C
+            float acc[8][32];
+            for (int t = 0; t < 8; t++) {
+                for (int c = 0; c < 32; c++) {
+                    acc[t][c] = 0.0f;
+                }
+            }
+            
+            // Reduce over OC
+            for (int o = 0; o < OC; o++) {
+                // Load weight row chunk: contiguous in memory
+                const float* w_ptr = weight + o * C + c_blk;
+                
+                // Load dout column chunk: strided in memory (stride OC)
+                // But efficient because of cache line spatial locality with next 'o' steps
+                // We load up to 8 scalars.
+                float d_vals[8];
+                for (int t = 0; t < cur_bt; t++) {
+                    d_vals[t] = dout[(bt_blk + t) * OC + o];
+                }
+                // Pad with 0 for safety if boundary
+                for (int t = cur_bt; t < 8; t++) d_vals[t] = 0.0f;
+                
+                // Vector math
+                #pragma omp simd
+                for (int c = 0; c < cur_c; c++) {
+                    float w = w_ptr[c];
+                    // Manual unroll for the BT dimension
+                    // We assume compiler vectorizes the 'c' loop (32 wide)
+                    acc[0][c] += d_vals[0] * w;
+                    acc[1][c] += d_vals[1] * w;
+                    acc[2][c] += d_vals[2] * w;
+                    acc[3][c] += d_vals[3] * w;
+                    acc[4][c] += d_vals[4] * w;
+                    acc[5][c] += d_vals[5] * w;
+                    acc[6][c] += d_vals[6] * w;
+                    acc[7][c] += d_vals[7] * w;
+                }
+            }
+            
+            // Accumulate back to dinp
+            for (int t = 0; t < cur_bt; t++) {
+                float* dinp_ptr = dinp + (bt_blk + t) * C + c_blk;
+                #pragma omp simd
+                for (int c = 0; c < cur_c; c++) {
+                    dinp_ptr[c] += acc[t][c];
+                }
+            }
         }
     }
+    END(matmul_backward_dinp);
 
-    // We block the B*T loop to keep the dout data in L2/L3 cache
-    // The inner loop iterates over i (columns of dinp)
+    START(matmul_backward_dweight_dbias);
+
+    // backward into weight/bias, parallelize over output channels OC
+    // Blocked by time to keep input data in cache
     int BT = B * T;
-    // Chunk size for blocking BT loop. 
-    // dout block size = 32 * OC * 4 bytes. If OC=50257, 128*50KB = 6.4 MB. Fits in L3.
-    const int BLOCK_BT = 32; 
+    const int BLOCK_BT = 256; // Fits in L2 cache
 
     #pragma omp parallel
     {
-        // Iterate over blocks of time steps
+        // Iterate over blocks of time steps (outer loop)
+        // This ensures that all threads work on the same time-slice of input data,
+        // improving cache locality for 'inp' which is shared across all 'o'.
         for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
-            int bt_end = (bt_blk + BLOCK_BT > BT) ? BT : (bt_blk + BLOCK_BT);
+            int current_bt_size = (bt_blk + BLOCK_BT > BT) ? (BT - bt_blk) : BLOCK_BT;
             
-            // Distribute columns of dinp among threads.
-            // Using static schedule ensures threads own distinct cache lines of dinp
-            // (assuming C is large enough, 768 > 16)
             #pragma omp for schedule(static)
-            for (int i = 0; i < C; i++) {
-                const float* w_row = weight_t + i * OC;
-                // Inner loop over the block of time steps
-                for (int bt = bt_blk; bt < bt_end; bt++) {
-                    const float* d_row = dout + bt * OC;
-                    float sum = 0.0f;
-                    // Vectorized dot product
-                    // This scans d_row (stride 1) and w_row (stride 1)
-                    #pragma omp simd reduction(+:sum)
-                    for (int o = 0; o < OC; o++) {
-                        sum += d_row[o] * w_row[o];
-                    }
-                    dinp[bt * C + i] += sum;
-                }
-            }
-        }
-    }
-    
-    free(weight_t);
+            for (int o = 0; o < OC; o++) {
+                float* dwrow = dweight + o * C;
+                float db_acc = 0.0f;
 
-    // backward into weight/bias, parallelize over output channels OC
-    // This part is also bandwidth bound but let's keep it simple for now as requested
-    #pragma omp parallel for
-    for (int o = 0; o < OC; o++) {
-        for (int b = 0; b < B; b++) {
-            for (int t = 0; t < T; t++) {
-                const float* dout_bt = dout + b * T * OC + t * OC;
-                const float* inp_bt = inp + b * T * C + t * C;
-                float* dwrow = dweight + o*C;
-                float d = dout_bt[o];
-                if (dbias != NULL) { dbias[o] += d; }
-                for (int i = 0; i < C; i++) {
-                    dwrow[i] += inp_bt[i] * d;
+                int t = 0;
+                // Unroll by 4 to amortize loop overhead and vector ops
+                for (; t <= current_bt_size - 4; t += 4) {
+                    int bt = bt_blk + t;
+                    
+                    // Load dout values (strided, but only 4 scalars)
+                    float d0 = dout[(bt+0)*OC + o];
+                    float d1 = dout[(bt+1)*OC + o];
+                    float d2 = dout[(bt+2)*OC + o];
+                    float d3 = dout[(bt+3)*OC + o];
+                    
+                    db_acc += d0 + d1 + d2 + d3;
+                    
+                    const float* inp0 = inp + (bt+0)*C;
+                    const float* inp1 = inp + (bt+1)*C;
+                    const float* inp2 = inp + (bt+2)*C;
+                    const float* inp3 = inp + (bt+3)*C;
+                    
+                    // Vectorized accumulation into dwrow
+                    // dwrow stays in L1 cache for the duration of this block
+                    #pragma omp simd
+                    for (int i = 0; i < C; i++) {
+                        float val = dwrow[i];
+                        val += d0 * inp0[i];
+                        val += d1 * inp1[i];
+                        val += d2 * inp2[i];
+                        val += d3 * inp3[i];
+                        dwrow[i] = val;
+                    }
+                }
+                
+                // Handle remaining time steps
+                for (; t < current_bt_size; t++) {
+                    int bt = bt_blk + t;
+                    float d = dout[bt*OC + o];
+                    db_acc += d;
+                    const float* inp_ptr = inp + bt*C;
+                    #pragma omp simd
+                    for (int i = 0; i < C; i++) {
+                        dwrow[i] += d * inp_ptr[i];
+                    }
+                }
+                
+                if (dbias != NULL) {
+                     dbias[o] += db_acc; 
                 }
             }
         }
     }
+    END(matmul_backward_dweight_dbias);
 }
 
 void attention_forward(float* out, float* preatt, float* att,
@@ -389,49 +493,77 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
     int hs = C / NH; // head size
     float scale = 1.f / sqrtf(hs);
 
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+        for (int h = 0; h < NH; h++) {
+            float* att_bth = att + b*NH*T*T + h*T*T;
+            float* datt_bth = datt + b*NH*T*T + h*T*T;
+            float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T;
+            float* dquery_t_base = dinp + b * T * C3 + h * hs;
+            float* query_t_base = inp + b * T * C3 + h * hs;
+            float* dout_bth_base = dout + b * T * C + h * hs;
+            float* k_base = inp + b * T * C3 + h * hs + C;
+            float* v_base = inp + b * T * C3 + h * hs + C*2;
+            float* dk_base = dinp + b * T * C3 + h * hs + C;
+            float* dv_base = dinp + b * T * C3 + h * hs + C*2;
 
-                // backward pass 4, through the value accumulation
-                float* dout_bth = dout + b * T * C + t * C + h * hs;
+            for (int t = 0; t < T; t++) {
+                float* att_t = att_bth + t*T;
+                float* datt_t = datt_bth + t*T;
+                float* dpreatt_t = dpreatt_bth + t*T;
+                
+                float* dquery_t = dquery_t_base + t * C3;
+                float* query_t = query_t_base + t * C3;
+                float* dout_t = dout_bth_base + t * C;
+                
+                // Pass 1: Calculate datt and dvalue, and accumulate sum for softmax derivative
+                float dp_sum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                    float* value_t2 = v_base + t2 * C3;
+                    float* dvalue_t2 = dv_base + t2 * C3;
+                    
+                    // datt[t2] = dot(value[t2], dout[t])
+                    float val = 0.0f;
+                    #pragma omp simd reduction(+:val)
                     for (int i = 0; i < hs; i++) {
-                        // in the forward pass this was:
-                        // out_bth[i] += att_bth[t2] * value_t2[i];
-                        // so now we have:
-                        datt_bth[t2] += value_t2[i] * dout_bth[i];
-                        dvalue_t2[i] += att_bth[t2] * dout_bth[i];
+                        val += value_t2[i] * dout_t[i];
                     }
-                }
-
-                // backward pass 2 & 3, the softmax
-                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
-                for (int t2 = 0; t2 <= t; t2++) {
-                    for (int t3 = 0; t3 <= t; t3++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                    }
-                }
-
-                // backward pass 1, the query @ key matmul
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    datt_t[t2] += val;
+                    
+                    float a = att_t[t2];
+                    // dvalue[t2] += att[t2] * dout[t]
+                    #pragma omp simd
                     for (int i = 0; i < hs; i++) {
-                        // in the forward pass this was:
-                        // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                        // so now we have:
-                        dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
-                        dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
+                        dvalue_t2[i] += a * dout_t[i];
+                    }
+                    
+                    // Accumulate for softmax gradient
+                    dp_sum += a * datt_t[t2];
+                }
+                
+                // Pass 2: Calculate dpreatt, dquery, dkey
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float a = att_t[t2];
+                    float da = datt_t[t2];
+                    
+                    // dpreatt = att * (datt - sum(att * datt))
+                    float dpreatt_val = a * (da - dp_sum);
+                    dpreatt_t[t2] += dpreatt_val;
+                    
+                    float factor = dpreatt_val * scale;
+                    float* key_t2 = k_base + t2 * C3;
+                    float* dkey_t2 = dk_base + t2 * C3;
+                    
+                    // dquery[t] += key[t2] * factor
+                    #pragma omp simd
+                    for (int i = 0; i < hs; i++) {
+                        dquery_t[i] += key_t2[i] * factor;
+                    }
+                    
+                    // dkey[t2] += query[t] * factor
+                    #pragma omp simd
+                    for (int i = 0; i < hs; i++) {
+                        dkey_t2[i] += query_t[i] * factor;
                     }
                 }
             }
@@ -797,34 +929,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-typedef struct {
-    double matmul_forward;
-    double matmul_backward;
-    double attention_forward;
-    double attention_backward;
-    double layernorm_forward;
-    double layernorm_backward;
-    double gelu_forward;
-    double gelu_backward;
-    double residual_forward;
-    double residual_backward;
-    double encoder_forward;
-    double encoder_backward;
-    double crossentropy_forward;
-    double crossentropy_softmax_backward;
-    double softmax_forward;
-    double adamw_update;
-} Profiling;
-Profiling profiling = {0};
-
-static double get_time() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-#define START(name) { double start_##name = get_time();
-#define END(name) profiling.name += get_time() - start_##name; }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
@@ -1041,9 +1145,7 @@ void gpt2_backward(GPT2 *model) {
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
     END(crossentropy_softmax_backward);
 
-    START(matmul_backward);
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
-    END(matmul_backward);
 
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
@@ -1108,17 +1210,13 @@ void gpt2_backward(GPT2 *model) {
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
         END(residual_backward);
 
-        START(matmul_backward);
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        END(matmul_backward);
 
         START(gelu_backward);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
         END(gelu_backward);
 
-        START(matmul_backward);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
-        END(matmul_backward);
 
         START(layernorm_backward);
         layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
@@ -1128,17 +1226,13 @@ void gpt2_backward(GPT2 *model) {
         residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
         END(residual_backward);
 
-        START(matmul_backward);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
-        END(matmul_backward);
 
         START(attention_backward);
         attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
         END(attention_backward);
 
-        START(matmul_backward);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
-        END(matmul_backward);
 
         START(layernorm_backward);
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
@@ -1320,13 +1414,14 @@ int main() {
     }
 
     // final profiling report
-    double total_time = profiling.matmul_forward + profiling.matmul_backward + profiling.attention_forward + profiling.attention_backward
+    double total_time = profiling.matmul_forward + profiling.matmul_backward_dinp + profiling.matmul_backward_dweight_dbias + profiling.attention_forward + profiling.attention_backward
                       + profiling.layernorm_forward + profiling.layernorm_backward + profiling.gelu_forward + profiling.gelu_backward
                       + profiling.residual_forward + profiling.residual_backward + profiling.encoder_forward + profiling.encoder_backward
                       + profiling.crossentropy_forward + profiling.crossentropy_softmax_backward + profiling.softmax_forward + profiling.adamw_update;
     printf("\n--- Profiling Report ---\n");
     printf("Matmul Forward:         %10.4f s (%5.1f%%)\n", profiling.matmul_forward, 100.0 * profiling.matmul_forward / total_time);
-    printf("Matmul Backward:        %10.4f s (%5.1f%%)\n", profiling.matmul_backward, 100.0 * profiling.matmul_backward / total_time);
+    printf("Matmul Backward (dinp): %10.4f s (%5.1f%%)\n", profiling.matmul_backward_dinp, 100.0 * profiling.matmul_backward_dinp / total_time);
+    printf("Matmul Backward (dw/db):%10.4f s (%5.1f%%)\n", profiling.matmul_backward_dweight_dbias, 100.0 * profiling.matmul_backward_dweight_dbias / total_time);
     printf("Attention Forward:      %10.4f s (%5.1f%%)\n", profiling.attention_forward, 100.0 * profiling.attention_forward / total_time);
     printf("Attention Backward:     %10.4f s (%5.1f%%)\n", profiling.attention_backward, 100.0 * profiling.attention_backward / total_time);
     printf("Layernorm Forward:      %10.4f s (%5.1f%%)\n", profiling.layernorm_forward, 100.0 * profiling.layernorm_forward / total_time);
