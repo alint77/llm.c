@@ -24,7 +24,12 @@ We have significantly improved the performance of the backward pass operations c
    - **Parallelization & Vectorization:** Added OpenMP threads and SIMD directives to fully saturate memory bandwidth.
    - **Loop Invariant Hoisting:** Pre-calculated scalar bias correction terms outside the parameter loop to reduce arithmetic intensity.
 
-4. **Profiling**
+4. **Matrix Multiplication Forward (`matmul_forward`) - ~1.2x Speedup**
+   - **Memory Packing:** Implemented dynamic swizzling/packing of input and weight matrices to improve cache locality. Weights are packed into block-major format to allow contiguous SIMD loading.
+   - **Cache Blocking:** Process data in blocks (8 time steps x 32 output channels) to keep working sets within L1/L2 cache.
+   - **Vectorization:** Fully vectorized inner loops using AVX instructions (implicit via compiler OMP simd).
+
+5. **Profiling**
    - Added a detailed profiling system to track the execution time of every individual layer (forward and backward passes).
    - Reports `tokens/s` throughput in real-time.
 
@@ -47,7 +52,7 @@ Comparing this optimized version against the vanilla reference implementation on
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 94.42 s | 480 tokens/s | 1.0x |
-| **Optimized** | **46.7 s** | **1020 tokens/s** | **2.1x** |
+| **Optimized** | **44.0 s** | **1060 tokens/s** | **2.15x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 

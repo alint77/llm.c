@@ -217,45 +217,109 @@ void matmul_forward_naive(float* out,
 void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_backward
-    // therefore, the implementation below is very mildly optimized
-    // this function is otherwise identical to that of matmul_forward_naive()
-    // OC is short for "output channels"
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // out will be (B,T,OC)
+    // Optimized matmul_forward with Packing/Swizzling
+    // inp: (B*T, C)
+    // weight: (OC, C)
+    // out: (B*T, OC)
 
-    // make sure the tiled loop will be correct or fallback to naive version
-    const int LOOP_UNROLL = 8;
-    if (B*T % LOOP_UNROLL != 0) {
-        matmul_forward_naive(out, inp, weight, bias, B, T, C, OC);
-        return;
+    // For standard GPT-2 sizes, B*T is multiple of 8, OC is multiple of 32
+    if ((B*T) % 8 != 0 || OC % 32 != 0) {
+         matmul_forward_naive(out, inp, weight, bias, B, T, C, OC);
+         return;
+    }
+    
+    int BT = B * T;
+    const int BLOCK_BT = 8;   // 8 rows of Input per step
+    const int BLOCK_OC = 32;  // 32 cols of Weight per step
+    
+    // Persistent buffers to avoid malloc overhead in hot loop
+    static float* packed_w = NULL;
+    static float* packed_i = NULL;
+    static size_t sz_w = 0;
+    static size_t sz_i = 0;
+    
+    size_t req_w = (size_t)OC * C * sizeof(float);
+    size_t req_i = (size_t)BT * C * sizeof(float);
+    
+    if (packed_w == NULL || sz_w < req_w) {
+        if (packed_w) free(packed_w);
+        packed_w = (float*)mallocCheck(req_w);
+        sz_w = req_w;
+    }
+    if (packed_i == NULL || sz_i < req_i) {
+        if (packed_i) free(packed_i);
+        packed_i = (float*)mallocCheck(req_i);
+        sz_i = req_i;
     }
 
-    // collapse the B and T loops into one and turn it into a strided loop.
-    // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
-    #pragma omp parallel for
-    for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
-        for (int o = 0; o < OC; o++) {
-            // we'll keep LOOP_UNROLL many results in registers
-            float result[LOOP_UNROLL];
-            // initialize the bias, if it exists
-            for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
-            }
-            // inner loops. Because we do LOOP_UNROLL steps of inner bt, we can cache
-            // the value of weight[i + o * C] and reuse it.
-            // we compile with -Ofast, so the compiler will turn the inner loop into FMAs
-            for (int i = 0; i < C; i++) {
-                float w = weight[i + o * C];
-                for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                    int bt = obt + ibt;
-                    result[ibt] += inp[bt * C + i] * w;
+    #pragma omp parallel
+    {
+        // 1. Pack Weights: (OC, C) -> (OC/32, C, 32)
+        #pragma omp for schedule(static)
+        for (int ob = 0; ob < OC; ob += BLOCK_OC) {
+            float* p_ptr = packed_w + ob * C;
+            for (int k = 0; k < C; k++) {
+                for (int o = 0; o < BLOCK_OC; o++) {
+                    *(p_ptr++) = weight[(ob + o) * C + k];
                 }
             }
-            // write back results to main memory
-            for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
-                int bt = obt + ibt;
-                out[bt * OC + o] = result[ibt];
+        }
+        
+        // 2. Pack Inputs: (BT, C) -> (BT/8, C, 8)
+        #pragma omp for schedule(static)
+        for (int btb = 0; btb < BT; btb += BLOCK_BT) {
+            float* p_ptr = packed_i + btb * C;
+            for (int k = 0; k < C; k++) {
+                for (int t = 0; t < BLOCK_BT; t++) {
+                    *(p_ptr++) = inp[(btb + t) * C + k];
+                }
+            }
+        }
+        
+        // 3. Compute
+        #pragma omp for schedule(static) 
+        for (int btb = 0; btb < BT; btb += BLOCK_BT) {
+            for (int ob = 0; ob < OC; ob += BLOCK_OC) {
+                
+                float acc[8][32]; // 8 * 32 float registers
+                
+                // Init with bias
+                for (int t = 0; t < 8; t++) {
+                    #pragma omp simd
+                    for (int o = 0; o < 32; o++) {
+                        acc[t][o] = (bias) ? bias[ob + o] : 0.0f;
+                    }
+                }
+                
+                const float* pi = packed_i + btb * C;
+                const float* pw = packed_w + ob * C;
+                
+                for (int k = 0; k < C; k++) {
+                    #pragma omp simd
+                    for (int o = 0; o < 32; o++) {
+                        float w_val = pw[o];
+                        acc[0][o] += pi[0] * w_val;
+                        acc[1][o] += pi[1] * w_val;
+                        acc[2][o] += pi[2] * w_val;
+                        acc[3][o] += pi[3] * w_val;
+                        acc[4][o] += pi[4] * w_val;
+                        acc[5][o] += pi[5] * w_val;
+                        acc[6][o] += pi[6] * w_val;
+                        acc[7][o] += pi[7] * w_val;
+                    }
+                    
+                    pi += BLOCK_BT;
+                    pw += BLOCK_OC;
+                }
+                
+                // Store
+                for (int t = 0; t < 8; t++) {
+                    float* out_ptr = out + (btb + t) * OC + ob;
+                    #pragma omp simd
+                    for (int o = 0; o < 32; o++) {
+                        out_ptr[o] = acc[t][o];
+                    }
+                }
             }
         }
     }
