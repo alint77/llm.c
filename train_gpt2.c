@@ -411,66 +411,94 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     int BT = B * T;
     const int BLOCK_BT = 256; // Fits in L2 cache
 
-    #pragma omp parallel
-    {
-        // Iterate over blocks of time steps (outer loop)
-        // This ensures that all threads work on the same time-slice of input data,
-        // improving cache locality for 'inp' which is shared across all 'o'.
-        for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
-            int current_bt_size = (bt_blk + BLOCK_BT > BT) ? (BT - bt_blk) : BLOCK_BT;
-            
-            #pragma omp for schedule(static)
-            for (int o = 0; o < OC; o++) {
-                float* dwrow = dweight + o * C;
-                float db_acc = 0.0f;
+    // Strategy:
+    // 1. Parallelize over Output Channels (OC) in blocks of 6 (AVX-512 friendly row count).
+    // 2. Iterate over Channels (C) in blocks of 32 (AVX-512 friendly vector length).
+    //    - This keeps the 'inp' stripe (BT x 32) resident in L2 cache (size ~512KB).
+    // 3. Inner loop over Time (BT) in blocks.
+    // 4. Innermost loop (t) processes 6x32 elements using register-based accumulation.
+    
+    #pragma omp parallel for
+    for (int o = 0; o < OC; o += 6) {
+        // Handle edges if OC is not multiple of 6
+        int cur_oc = (o + 6 > OC) ? (OC - o) : 6;
+        
+        // Loop over Input Channels C in blocks of 32
+        for (int c = 0; c < C; c += 32) {
+             // Register accumulators for 6 rows * 32 columns
+             float acc[6][32];
+             for(int r = 0; r < 6; r++) {
+                for(int k = 0; k < 32; k++) {
+                    acc[r][k] = 0.0f;
+                }
+             }
+             
+             // Loop over time blocks
+             for (int bt_blk = 0; bt_blk < BT; bt_blk += BLOCK_BT) {
+                 int cur_bt = (bt_blk + BLOCK_BT > BT) ? (BT - bt_blk) : BLOCK_BT;
+                 
+                 // --- Bias Gradient (dbias) ---
+                 // Only compute bias once per OC block (when c == 0)
+                 if (c == 0 && dbias) {
+                     for (int i = 0; i < cur_oc; i++) {
+                         float val = 0.0f;
+                         int o_idx = o + i;
+                         #pragma omp simd reduction(+:val)
+                         for (int t = 0; t < cur_bt; t++) {
+                             val += dout[(bt_blk + t) * OC + o_idx];
+                         }
+                         dbias[o_idx] += val; 
+                    }
+                 }
 
-                int t = 0;
-                // Unroll by 4 to amortize loop overhead and vector ops
-                for (; t <= current_bt_size - 4; t += 4) {
-                    int bt = bt_blk + t;
-                    
-                    // Load dout values (strided, but only 4 scalars)
-                    float d0 = dout[(bt+0)*OC + o];
-                    float d1 = dout[(bt+1)*OC + o];
-                    float d2 = dout[(bt+2)*OC + o];
-                    float d3 = dout[(bt+3)*OC + o];
-                    
-                    db_acc += d0 + d1 + d2 + d3;
-                    
-                    const float* inp0 = inp + (bt+0)*C;
-                    const float* inp1 = inp + (bt+1)*C;
-                    const float* inp2 = inp + (bt+2)*C;
-                    const float* inp3 = inp + (bt+3)*C;
-                    
-                    // Vectorized accumulation into dwrow
-                    // dwrow stays in L1 cache for the duration of this block
-                    #pragma omp simd
-                    for (int i = 0; i < C; i++) {
-                        float val = dwrow[i];
-                        val += d0 * inp0[i];
-                        val += d1 * inp1[i];
-                        val += d2 * inp2[i];
-                        val += d3 * inp3[i];
-                        dwrow[i] = val;
-                    }
-                }
-                
-                // Handle remaining time steps
-                for (; t < current_bt_size; t++) {
-                    int bt = bt_blk + t;
-                    float d = dout[bt*OC + o];
-                    db_acc += d;
-                    const float* inp_ptr = inp + bt*C;
-                    #pragma omp simd
-                    for (int i = 0; i < C; i++) {
-                        dwrow[i] += d * inp_ptr[i];
-                    }
-                }
-                
-                if (dbias != NULL) {
-                     dbias[o] += db_acc; 
-                }
-            }
+                 // --- Weight Gradient Kernel ---
+                 for (int t = 0; t < cur_bt; t++) {
+                     int t_global = bt_blk + t;
+                     const float* d_ptr = dout + t_global * OC + o;
+                     const float* i_ptr = inp + t_global * C + c;
+                     
+                     if (cur_oc == 6) {
+                         // Fast path: Unroll 6 rows
+                         float d0 = d_ptr[0];
+                         float d1 = d_ptr[1];
+                         float d2 = d_ptr[2];
+                         float d3 = d_ptr[3];
+                         float d4 = d_ptr[4];
+                         float d5 = d_ptr[5];
+                         
+                         #pragma omp simd
+                         for (int k = 0; k < 32; k++) {
+                             float val = i_ptr[k];
+                             acc[0][k] += d0 * val;
+                             acc[1][k] += d1 * val;
+                             acc[2][k] += d2 * val;
+                             acc[3][k] += d3 * val;
+                             acc[4][k] += d4 * val;
+                             acc[5][k] += d5 * val;
+                         }
+                     } else {
+                         // Fallback path
+                         for (int r = 0; r < cur_oc; r++) {
+                             float d = d_ptr[r];
+                             #pragma omp simd
+                             for (int k = 0; k < 32; k++) {
+                                 acc[r][k] += d * i_ptr[k];
+                             }
+                         }
+                     }
+                 }
+             }
+             
+             // Accumulate back to global dweight
+             for (int r = 0; r < cur_oc; r++) {
+                 float* dw_row = dweight + (o + r) * C + c;
+                 #pragma omp simd
+                 for (int k = 0; k < 32; k++) {
+                     if (c + k < C) { 
+                         dw_row[k] += acc[r][k];
+                     }
+                 }
+             }
         }
     }
     END(matmul_backward_dweight_dbias);
@@ -1410,7 +1438,7 @@ int main() {
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 16; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);

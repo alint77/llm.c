@@ -11,8 +11,8 @@ We have significantly improved the performance of the backward pass operations c
 ### Key Changes
 1. **Matrix Multiplication Backward (`matmul_backward`) - ~2.5x Speedup**
    - Split calculations into separate optimal paths for `dinp` and `dweight`/`dbias`.
-   - **`dweight` / `dbias`:** Implemented "time-blocking" (BT blocks) to keep input data in the L2 cache, preventing repeated expensive memory fetches.
-   - **`dinp`:** Implemented register-blocked matrix multiplication (8x32 blocks) to maximize register reuse and vector instruction throughput.
+   - **`dweight` / `dbias`:** Implemented a **6x32 blocked register accumulation kernel**. Parallelizes over blocks of 6 Output Channels and loops over blocks of 32 Input Channels, utilizing 12 AVX-512 registers to accumulate results with maximal arithmetic intensity. Keeps `inp` stripes resident in L2 cache.
+   - **`dinp`:** Optimized memory access pattern by packing `dout` (gradient of output) into local buffers before the transpose-multiply operation. This enables contiguous access for SIMD instructions.
 
 2. **Attention Backward (`attention_backward`) - ~58x Speedup**
    - **Algorithmic Improvement:** Replaced the naive O(T³) softmax gradient calculation with an O(T²) linear-time version using the properties of the Softmax derivative (mathematically equivalent to the efficient gradient formulation used in Flash Attention).
@@ -45,14 +45,14 @@ Comparing this optimized version against the vanilla reference implementation on
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 23.37 s | 460 tokens/s | 1.0x |
-| **Optimized** | **13.5 s** | **880 tokens/s** | **2x** |
+| **Optimized** | **12.3 s** | **980 tokens/s** | **2.1x** |
 
 ### Batch Size = 16
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 94.42 s | 480 tokens/s | 1.0x |
-| **Optimized** | **38.8.0 s** | **1250 tokens/s** | **2.6x** |
+| **Optimized** | **35.2.0 s** | **1400 tokens/s** | **2.9x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 
@@ -76,24 +76,24 @@ At the end of training, you will see a detailed breakdown of where time is spent
 
 ```
 --- Profiling Report ---
-Matmul Forward:            10.3064 s ( 26.9%)
-Matmul Backward (dinp):     8.4260 s ( 22.0%)
-Matmul Backward (dw/db):   12.0494 s ( 31.4%)
-Attention Forward:          0.2818 s (  0.7%)
-Attention Backward:         0.3682 s (  1.0%)
-Layernorm Forward:          0.2764 s (  0.7%)
-Layernorm Backward:         0.7222 s (  1.9%)
-Gelu Forward:               0.6990 s (  1.8%)
-Gelu Backward:              0.7324 s (  1.9%)
-Residual Forward:           0.3168 s (  0.8%)
-Residual Backward:          0.2182 s (  0.6%)
-Encoder Forward:            0.0140 s (  0.0%)
-Encoder Backward:           0.0081 s (  0.0%)
+Matmul Forward:            10.1596 s ( 28.8%)
+Matmul Backward (dinp):     9.4463 s ( 26.8%)
+Matmul Backward (dw/db):    8.0421 s ( 22.8%)
+Attention Forward:          0.2879 s (  0.8%)
+Attention Backward:         0.3867 s (  1.1%)
+Layernorm Forward:          0.2710 s (  0.8%)
+Layernorm Backward:         0.7223 s (  2.0%)
+Gelu Forward:               0.7362 s (  2.1%)
+Gelu Backward:              0.7322 s (  2.1%)
+Residual Forward:           0.3241 s (  0.9%)
+Residual Backward:          0.2107 s (  0.6%)
+Encoder Forward:            0.0139 s (  0.0%)
+Encoder Backward:           0.0079 s (  0.0%)
 Crossentropy Forward:       0.0022 s (  0.0%)
-Crossentropy Backward:      0.4824 s (  1.3%)
-Softmax Forward:            0.7360 s (  1.9%)
-AdamW Update:               2.7057 s (  7.1%)
-Total Measured Time:       38.3450 s
+Crossentropy Backward:      0.4890 s (  1.4%)
+Softmax Forward:            0.7364 s (  2.1%)
+AdamW Update:               2.7018 s (  7.7%)
+Total Measured Time:       35.2703 s
 ```
 
 ## License
