@@ -29,12 +29,21 @@ We have significantly improved the performance of the backward pass operations c
 Comparing this optimized version against the vanilla reference implementation on a high-end CPU.
 
 **Hardware:** AMD Ryzen 9 9950X (16 cores, 32 threads)
-**Settings:** `OMP_NUM_THREADS=16`, Batch Size=4
+**Settings:** `OMP_NUM_THREADS=16`
+
+### Batch Size = 4 (Default)
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
-| Vanilla | ~94.4s | ~16.9s/pass | 1.0x |
-| **Optimized** | **~47.6s** | **~8.5s/pass** | **~2.0x** |
+| Vanilla | 23.37 s | 440 tokens/s | 1.0x |
+| **Optimized** | **15.21 s** | **760 tokens/s** | **1.54x** |
+
+### Batch Size = 16
+
+| Version | Total Time (40 steps) | Throughput | Speedup |
+|---------|-----------------------|------------|---------|
+| Vanilla | 94.42 s | 480 tokens/s | 1.0x |
+| **Optimized** | **47.64 s** | **1000 tokens/s** | **2.1x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 
