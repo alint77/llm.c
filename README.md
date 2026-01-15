@@ -24,10 +24,10 @@ We have significantly improved the performance of the backward pass operations c
    - **Parallelization & Vectorization:** Added OpenMP threads and SIMD directives to fully saturate memory bandwidth.
    - **Loop Invariant Hoisting:** Pre-calculated scalar bias correction terms outside the parameter loop to reduce arithmetic intensity.
 
-4. **Matrix Multiplication Forward (`matmul_forward`) - ~1.2x Speedup**
-   - **Memory Packing:** Implemented dynamic swizzling/packing of input and weight matrices to improve cache locality. Weights are packed into block-major format to allow contiguous SIMD loading.
-   - **Cache Blocking:** Process data in blocks (8 time steps x 32 output channels) to keep working sets within L1/L2 cache.
-   - **Vectorization:** Fully vectorized inner loops using AVX instructions (implicit via compiler OMP simd).
+4. **Matrix Multiplication Forward (`matmul_forward`)**
+   - **Loop Ordering (Cache Blocking):** Swapped the loop order to process Output Channels (`OC`) in the outer loop. This keeps a block of weights (~12-48KB) hot in the L2 cache while streaming the large input activations (12MB), significantly reducing memory bandwidth usage by preventing weight thrashing.
+   - **Parallelization:** Parallelized over the `OC` dimension to give each thread a dedicated slice of weights to keep in its private cache.
+   - **Memory Packing:** Implemented dynamic swizzling/packing of input and weight matrices into block-major format to allow contiguous SIMD loading.
 
 5. **Profiling**
    - Added a detailed profiling system to track the execution time of every individual layer (forward and backward passes).
@@ -45,14 +45,14 @@ Comparing this optimized version against the vanilla reference implementation on
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 23.37 s | 460 tokens/s | 1.0x |
-| **Optimized** | **12.3 s** | **980 tokens/s** | **2.1x** |
+| **Optimized** | **11.3 s** | **1050 tokens/s** | **2.3x** |
 
 ### Batch Size = 16
 
 | Version | Total Time (40 steps) | Throughput | Speedup |
 |---------|-----------------------|------------|---------|
 | Vanilla | 94.42 s | 480 tokens/s | 1.0x |
-| **Optimized** | **35.2.0 s** | **1400 tokens/s** | **2.9x** |
+| **Optimized** | **31.88 s** | **1470 tokens/s** | **3x** |
 
 *(Note: "Vanilla" refers to the original `train_gpt2.c` implementation from the parent repo)*
 
@@ -72,28 +72,52 @@ Comparing this optimized version against the vanilla reference implementation on
 
 ## Profiling Output Example
 
-At the end of training, you will see a detailed breakdown of where time is spent:
+At the end of training, you will see a detailed breakdown of where time is spent (BS=16):
 
 ```
 --- Profiling Report ---
-Matmul Forward:            10.1596 s ( 28.8%)
-Matmul Backward (dinp):     9.4463 s ( 26.8%)
-Matmul Backward (dw/db):    8.0421 s ( 22.8%)
-Attention Forward:          0.2879 s (  0.8%)
-Attention Backward:         0.3867 s (  1.1%)
-Layernorm Forward:          0.2710 s (  0.8%)
-Layernorm Backward:         0.7223 s (  2.0%)
-Gelu Forward:               0.7362 s (  2.1%)
-Gelu Backward:              0.7322 s (  2.1%)
-Residual Forward:           0.3241 s (  0.9%)
-Residual Backward:          0.2107 s (  0.6%)
-Encoder Forward:            0.0139 s (  0.0%)
-Encoder Backward:           0.0079 s (  0.0%)
-Crossentropy Forward:       0.0022 s (  0.0%)
-Crossentropy Backward:      0.4890 s (  1.4%)
-Softmax Forward:            0.7364 s (  2.1%)
-AdamW Update:               2.7018 s (  7.7%)
-Total Measured Time:       35.2703 s
+Matmul Forward:             7.5245 s ( 23.6%)
+Matmul Backward (dinp):     8.6685 s ( 27.2%)
+Matmul Backward (dw/db):    8.0532 s ( 25.3%)
+Attention Forward:          0.3352 s (  1.1%)
+Attention Backward:         0.3850 s (  1.2%)
+Layernorm Forward:          0.2659 s (  0.8%)
+Layernorm Backward:         0.7131 s (  2.2%)
+Gelu Forward:               0.6809 s (  2.1%)
+Gelu Backward:              0.7474 s (  2.3%)
+Residual Forward:           0.3171 s (  1.0%)
+Residual Backward:          0.2063 s (  0.6%)
+Encoder Forward:            0.0142 s (  0.0%)
+Encoder Backward:           0.0077 s (  0.0%)
+Crossentropy Forward:       0.0021 s (  0.0%)
+Crossentropy Backward:      0.4799 s (  1.5%)
+Softmax Forward:            0.7883 s (  2.5%)
+AdamW Update:               2.6976 s (  8.5%)
+Total Measured Time:       31.8869 s
+```
+
+Also here's the profiling results of the original llm.c code:
+
+```
+--- Profiling Report ---
+Matmul Forward:            12.2042 s ( 12.8%)
+Matmul Backward (dinp):    33.9888 s ( 35.6%)
+Matmul Backward (dw/db):   18.1879 s ( 19.0%)
+Attention Forward:          0.2674 s (  0.3%)
+Attention Backward:        23.5974 s ( 24.7%)
+Layernorm Forward:          0.2720 s (  0.3%)
+Layernorm Backward:         0.7534 s (  0.8%)
+Gelu Forward:               0.6676 s (  0.7%)
+Gelu Backward:              0.7542 s (  0.8%)
+Residual Forward:           0.3018 s (  0.3%)
+Residual Backward:          0.2195 s (  0.2%)
+Encoder Forward:            0.0136 s (  0.0%)
+Encoder Backward:           0.0089 s (  0.0%)
+Crossentropy Forward:       0.0021 s (  0.0%)
+Crossentropy Backward:      0.4885 s (  0.5%)
+Softmax Forward:            0.7398 s (  0.8%)
+AdamW Update:               3.0271 s (  3.2%)
+Total Measured Time:       95.4942 s
 ```
 
 ## License
